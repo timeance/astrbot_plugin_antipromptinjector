@@ -10,6 +10,7 @@ import sys
 import tempfile
 import uuid
 from functools import partial
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -430,6 +431,50 @@ async def test_main_request_block_and_normal_control(loaded, main_request):
 
     allowed = await assert_normal_turn(main_request)
     assert_dispatched(allowed)
+
+
+@pytest.mark.asyncio
+async def test_real_priority_order_and_cancelled_review(loaded, main_request):
+    from astrbot.core.star.star_handler import star_handlers_registry
+
+    hook, = request_hooks()
+    assert hook.extras_configs["priority"] == -1000
+
+    async def witness(event, req):
+        pass
+
+    peers = [replace(hook, handler_name=name, handler_full_name=f"{MODULE}_{name}",
+                     handler=witness, extras_configs={"priority": priority})
+             for name, priority in (("after_check", -1001), ("before_check", 999))]
+
+    def order(event):
+        return [call.kwargs["handler"] for call in event.trace.record.call_args_list
+                if call.args == ("handler_start",) and call.kwargs.get("hook") == "OnLLMRequestEvent"]
+
+    try:
+        for peer in peers:
+            star_handlers_registry.append(peer)
+        allowed = await assert_normal_turn(main_request)
+        assert order(allowed) == ["before_check", "intercept_llm_request", "after_check"]
+        main_request.provider.text_chat.reset_mock()
+        main_request.tool_calls.clear()
+
+        review = MagicMock()
+        review.meta.return_value = SimpleNamespace(id="qa-review", provider_type=SimpleNamespace(value="chat_completion"))
+        review.get_model.return_value = "qa-model"
+        review.text_chat = AsyncMock(side_effect=asyncio.CancelledError)
+        loaded.context.get_provider_by_id.side_effect = {"primary": main_request.provider, "qa-review": review}.get
+        loaded.star.config.update(llm_analysis_mode="active", llm_analysis_private_chat_enabled=True,
+                                  review_provider="qa-review")
+        cancelled = await main_request.process("host-cancelled")
+        review.text_chat.assert_awaited_once()
+        assert cancelled.is_stopped()
+        assert order(cancelled) == ["before_check", "intercept_llm_request"]
+        main_request.provider.text_chat.assert_not_awaited()
+        assert not main_request.tool_calls
+    finally:
+        for peer in peers:
+            star_handlers_registry.remove(peer)
 
 
 @pytest.mark.asyncio

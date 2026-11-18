@@ -261,6 +261,7 @@ async def test_same_session_concurrent_cancelled_and_failed_review_release_budge
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 2)
     assert released.is_set()
+    assert first.is_stopped()
     assert len(runtime.records()) == 1
     first.send.assert_not_awaited()
 

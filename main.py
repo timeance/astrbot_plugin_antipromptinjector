@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 from pathlib import Path
@@ -166,6 +167,10 @@ class AntiPromptInjector(Star):
             if action == "block":
                 await event.send(event.plain_result(RETRY if decision["reason"] in (
                     "inspection_incomplete", "review_failure") else DENIED))
+        except asyncio.CancelledError:
+            # v4.29.4 catches BaseException around hooks and then checks the stop flag.
+            event.stop_event()
+            raise
         except Exception:
             logger.error("AntiPromptInjector: 请求处理失败。")
             if stopped:
