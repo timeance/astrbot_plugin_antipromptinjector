@@ -37,8 +37,7 @@ const fieldHelp = {
   },
   auto_blacklist: "仅对已确认且实际替换或阻断的技术注入生效。",
   blacklist_duration: "0 表示永久。",
-  review_provider: "留空时按会话来源选择，不回退到其他 Provider。",
-  review_model: "留空时使用该 Provider 的配置。",
+  gentle_refusal: "仅在因注入风险阻断时生成一句拒绝，可能产生模型费用。不会发送被拦截的消息。",
   review_failure_policy: {
     graded: "可疑证据需要完成复核，失败则阻断；主动复核故障可放行普通请求。",
     strict: "凡是需要复核，失败即阻断；故障不处罚。",
@@ -56,6 +55,9 @@ let records = null;
 let adopt = null;
 let visibleRecords = [];
 let recordLimit = 50;
+let providerChoices = null;
+let modelChoices = new Map();
+const pickerKeys = new Set(["review_provider", "review_model", "refusal_provider", "refusal_model"]);
 const versions = {};
 const get = (path) => bridge.apiGet(path);
 const post = (path, body) => bridge.apiPost(path, body);
@@ -156,11 +158,67 @@ function renderOverview() {
     : "未配置复核 Provider，暂不可试算。";
 }
 
+function optionsFor(control, items, current, missing) {
+  control.replaceChildren(...items.map(([value, text]) => new Option(text, value)));
+  if (current && !items.some(([value]) => value === current)) {
+    control.add(new Option(`${current}（${missing}）`, current));
+  }
+  control.value = current;
+}
+
+function updatePickers() {
+  for (const prefix of ["review", "refusal"]) {
+    const p = $(`field-${prefix}_provider`), m = $(`field-${prefix}_model`);
+    if (!p || !m) continue;
+    const id = draft[`${prefix}_provider`], current = draft[`${prefix}_model`];
+    const off = prefix === "refusal" && !draft.gentle_refusal;
+    const providers = providerChoices || [];
+    const found = providers.find((entry) => entry.id === id);
+    optionsFor(p, [["", "跟随会话"], ...providers.map((entry) => [entry.id, entry.id])], id,
+      providerChoices ? "当前不可用" : "已保存");
+    p.disabled = saving || configLoading || off;
+    const state = modelChoices.get(id);
+    const names = [...new Set([found?.model, ...(state?.names || [])].filter(Boolean))];
+    const defaultText = id ? (found?.model ? `提供商默认（${found.model}）` : "提供商默认")
+      : prefix === "refusal" ? "跟随会话模型" : "会话提供商的默认模型";
+    optionsFor(m, [["", defaultText], ...names.map((name) => [name, name])], current,
+      state?.status === "ready" ? "未列出" : "已保存");
+    // Keep a legacy session-wide override clearable, even without an explicit provider.
+    m.disabled = saving || configLoading || off || (!id && !current);
+    $(`help-${prefix}_provider`).textContent = providerChoices === null ? "提供商列表未载入，可刷新重试。"
+      : !providers.length ? "尚无可用的对话提供商。" : "";
+    $(`help-${prefix}_model`).textContent = !id ? "指定提供商后可选其他模型。"
+      : state?.status === "loading" ? "正在获取模型…"
+      : state?.status === "error" ? "模型列表未能载入，可使用默认模型或刷新重试。" : "";
+  }
+}
+
+async function loadVisibleModels() {
+  for (const prefix of ["review", "refusal"]) {
+    if (tab !== (prefix === "review" ? "review" : "defense") || (prefix === "refusal" && !draft.gentle_refusal)) continue;
+    const id = draft[`${prefix}_provider`];
+    const cache = modelChoices;
+    if (!id || !providerChoices?.some((item) => item.id === id) || cache.has(id)) continue;
+    cache.set(id, {status: "loading"});
+    updatePickers();
+    try {
+      const names = await post("models", {provider: id});
+      if (!Array.isArray(names)) throw new Error("Invalid list");
+      cache.set(id, {status: "ready", names});
+    } catch {
+      cache.set(id, {status: "error"});
+    }
+    if (cache === modelChoices) updatePickers();
+  }
+}
+
 function renderSettings() {
   for (const id of ["defense-fields", "defense-advanced", "review-fields", "review-advanced"]) $(id).replaceChildren();
   for (const [key, spec] of Object.entries(snapshot.fields)) {
     let control;
-    if (Array.isArray(spec.options)) {
+    if (pickerKeys.has(key)) {
+      control = node("select");
+    } else if (Array.isArray(spec.options)) {
       control = node("select");
       for (const option of spec.options) {
         const item = node("option", label(option));
@@ -180,12 +238,13 @@ function renderSettings() {
     const row = node("label", null, "field");
     const title = node("span", spec.description);
     const help = node("small");
+    help.id = `help-${key}`;
     function updateHelp() {
       const text = fieldHelp[key];
       help.textContent = (typeof text === "object" ? text[draft[key]] : text) || "";
     }
     updateHelp();
-    if (fieldHelp[key]) title.append(help);
+    if (fieldHelp[key] || pickerKeys.has(key)) title.append(help);
     row.append(title, control);
     const section = reviewKeys.has(key) ? "review" : "defense";
     $(`${section}-${advancedKeys.has(key) ? "advanced" : "fields"}`).append(row);
@@ -193,10 +252,18 @@ function renderSettings() {
       draft[key] = spec.type === "bool" ? control.checked
         : ["int", "float"].includes(spec.type) ? (Number.isFinite(control.valueAsNumber) ? control.valueAsNumber : null)
           : control.value;
+      if (key === "review_provider" || key === "refusal_provider") {
+        draft[key.replace("_provider", "_model")] = "";
+      }
       updateHelp();
+      if (pickerKeys.has(key) || key === "gentle_refusal") {
+        updatePickers();
+        void loadVisibleModels();
+      }
       if (!saving && !conflicted) saveState(isDirty() ? "有未保存的更改" : baseStatus());
     });
   }
+  updatePickers();
 }
 
 async function loadSettings(discard = false) {
@@ -206,9 +273,11 @@ async function loadSettings(discard = false) {
   for (const input of all("[id^=field-]")) input.disabled = true;
   saveState("正在载入设置…");
   try {
-    const latest = await get("settings");
+    const [latest, choices] = await Promise.all([get("settings"), get("providers").catch(() => null)]);
     if (!latest?.revision || !latest.config || !latest.fields) throw new Error("设置响应不完整");
     snapshot = latest;
+    providerChoices = Array.isArray(choices) ? choices : null;
+    modelChoices = new Map();
     draft = { ...snapshot.config };
     conflicted = false;
     renderSettings();
@@ -224,6 +293,8 @@ async function loadSettings(discard = false) {
   } finally {
     configLoading = false;
     for (const input of all("[id^=field-]")) input.disabled = false;
+    updatePickers();
+    void loadVisibleModels();
   }
   saveState(baseStatus(), snapshot.apply_status === "apply_failed");
 }
@@ -272,12 +343,15 @@ async function save() {
   } finally {
     for (const field of all("[id^=field-]")) field.disabled = false;
     saving = false;
+    updatePickers();
+    void loadVisibleModels();
     saveState(status, error);
   }
 }
 
 function showTab(next) {
   tab = next;
+  void loadVisibleModels();
   all("[data-panel]").forEach((panel) => { panel.hidden = panel.dataset.panel !== tab; });
   all("[data-tab]").forEach((item) => {
     if (item.dataset.tab === tab) item.setAttribute("aria-current", "page");

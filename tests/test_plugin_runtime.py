@@ -150,6 +150,65 @@ def runtime(runtime_modules, monkeypatch):
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("explicit", [True, False])
+async def test_gentle_refusal_follows_persona_not_original_request(runtime, explicit):
+    runtime.settings(defense_mode="intercept", llm_analysis_mode="disabled", gentle_refusal=True,
+                     refusal_provider="fixture-provider" if explicit else "",
+                     refusal_model="independent-model" if explicit else "")
+    event, req = runtime.turn(MARKER)
+    req.model = "session-model"
+    persona = AsyncMock(return_value=("fixture", {"prompt": "安静温和。"}, None, False))
+    runtime.context.persona_manager = SimpleNamespace(resolve_selected_persona=persona)
+    answer = "这件事我帮不上忙呀。"
+
+    async def generate(**kwargs):
+        assert event.is_stopped()
+        return SimpleNamespace(role="assistant", is_chunk=False, completion_text=answer,
+                               tools_call_name=[], tools_call_args=[], tools_call_ids=[])
+
+    runtime.provider.text_chat.side_effect = generate
+    await runtime.hook(event, req)
+    assert event.is_stopped()
+    assert event.send.await_args.args[0].get_plain_text() == answer
+    args = runtime.provider.text_chat.await_args.kwargs
+    assert args["system_prompt"] == "安静温和。"
+    assert MARKER not in str(args) and req.system_prompt not in str(args)
+    assert args["contexts"] == [] and args["func_tool"] is None
+    assert args["model"] == ("independent-model" if explicit else "session-model")
+    if explicit:
+        runtime.context.get_using_provider_async.assert_not_awaited()
+    else:
+        runtime.context.get_using_provider_async.assert_awaited_once_with(event.unified_msg_origin)
+
+
+@pytest.mark.parametrize("case", ["missing", "timeout", "invalid", "paragraph", "disabled", "blacklist", "observe", "harden", "review_fault"])
+async def test_refusal_fallback_and_non_triggers(runtime, case):
+    runtime.settings(defense_mode="sentry" if case == "harden" else "aegis" if case == "review_fault" else "intercept",
+                     llm_analysis_mode="disabled", gentle_refusal=case != "disabled",
+                     refusal_provider="fixture-provider")
+    event, req = runtime.turn(MARKER)
+    runtime.context.persona_manager = SimpleNamespace(resolve_selected_persona=AsyncMock(return_value=(None, None, None, False)))
+    if case == "blacklist":
+        runtime.instance.state.put_entry("blacklist", runtime.identity(event))
+    if case == "observe":
+        runtime.instance.web_set_observation(3)
+    if case == "missing":
+        runtime.context.get_provider_by_id.return_value = None
+    if case == "timeout":
+        runtime.provider.text_chat.side_effect = TimeoutError()
+    if case == "invalid":
+        runtime.provider.text_chat.return_value = SimpleNamespace(role="error")
+    if case == "paragraph":
+        runtime.provider.text_chat.return_value = SimpleNamespace(role="assistant", is_chunk=False,
+            tools_call_name=[], tools_call_args=[], tools_call_ids=[], completion_text="对不起。换个话题吧。")
+    await runtime.hook(event, req)
+    assert event.is_stopped() == (case not in ("observe", "harden"))
+    if event.is_stopped():
+        assert event.send.await_args.args[0].get_plain_text() == (runtime.main.RETRY if case == "review_fault" else runtime.main.DENIED)
+    assert runtime.provider.text_chat.await_count == int(case in ("timeout", "invalid", "paragraph"))
+    runtime.context.get_using_provider_async.assert_not_awaited()
+
+
 @pytest.mark.parametrize("text,stopped", [(NORMAL, False), (MARKER, True)], ids=["ordinary", "required-review"])
 async def test_private_review_disabled_makes_zero_provider_calls(runtime, text, stopped):
     runtime.settings(defense_mode="aegis", llm_analysis_mode="active",

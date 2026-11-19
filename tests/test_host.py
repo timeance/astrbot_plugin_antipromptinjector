@@ -478,7 +478,8 @@ async def test_real_priority_order_and_cancelled_review(loaded, main_request):
 
 
 @pytest.mark.asyncio
-async def test_review_decision_uses_only_the_configured_fake_provider(loaded, main_request):
+@pytest.mark.parametrize("gentle", [False, True])
+async def test_review_decision_uses_only_the_configured_fake_provider(loaded, main_request, gentle):
     review_provider = MagicMock()
     review_provider.meta.return_value = SimpleNamespace(
         id="host-review", provider_type=SimpleNamespace(value="chat_completion")
@@ -495,13 +496,17 @@ async def test_review_decision_uses_only_the_configured_fake_provider(loaded, ma
             for verdict in (True, False)
         ]
     )
+    refusal = MagicMock()
+    refusal.meta.return_value = SimpleNamespace(id="refusal", provider_type=SimpleNamespace(value="chat_completion"))
+    refusal.text_chat = AsyncMock(return_value=main_request.response(role="assistant", completion_text="抱歉，这次不方便。"))
     loaded.context.get_provider_by_id.side_effect = {
-        "primary": main_request.provider, "host-review": review_provider
+        "primary": main_request.provider, "host-review": review_provider, "refusal": refusal,
     }.get
     loaded.star.config.update(
         llm_analysis_mode="active",
         llm_analysis_private_chat_enabled=True,
         review_provider="host-review",
+        gentle_refusal=gentle, refusal_provider="refusal",
     )
     denied = await main_request.process("host-review-denied")
     assert_dispatched(denied)
@@ -510,7 +515,11 @@ async def test_review_decision_uses_only_the_configured_fake_provider(loaded, ma
     assert review_provider.text_chat.await_args.kwargs["func_tool"] is None
     main_request.provider.text_chat.assert_not_awaited()
     assert main_request.tool_calls == []
+    assert refusal.text_chat.await_count == int(gentle)
+    if gentle:
+        assert denied.send.await_args.args[0].get_plain_text() == "抱歉，这次不方便。"
 
     allowed = await assert_normal_turn(main_request)
     assert_dispatched(allowed)
     assert review_provider.text_chat.await_count == 2
+    assert refusal.text_chat.await_count == int(gentle)

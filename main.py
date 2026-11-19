@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 import uuid
 from pathlib import Path
@@ -34,13 +35,14 @@ def _review_data(result):
     }
 
 
-@register("antipromptinjector", "LumineStory", "提示词防护与可选模型复核", "4.0.0")
+@register("antipromptinjector", "LumineStory", "提示词防护与可选模型复核", "4.1.0")
 class AntiPromptInjector(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.state = PluginState(config, StarTools.get_data_dir("antipromptinjector"))
         self.detector = PromptThreatDetector()
         self.reviewer = ReviewService(context)
+        self._refusals_in_flight = 0
         self._closed = False
         self._routes = []
         register_web_api(self)
@@ -165,8 +167,14 @@ class AntiPromptInjector(Star):
             except Exception:
                 logger.error("AntiPromptInjector: 无法保存本轮诊断记录。")
             if action == "block":
-                await event.send(event.plain_result(RETRY if decision["reason"] in (
-                    "inspection_incomplete", "review_failure") else DENIED))
+                reply = DENIED
+                if decision["reason"] in ("inspection_incomplete", "review_failure"):
+                    reply = RETRY
+                elif cfg["gentle_refusal"] and decision["reason"] in (
+                    "rule_evidence", "review_confirmed", "replacement_unavailable",
+                ):
+                    reply = await self._gentle_refusal(event, req, cfg)
+                await event.send(event.plain_result(reply))
         except asyncio.CancelledError:
             # v4.29.4 catches BaseException around hooks and then checks the stop flag.
             event.stop_event()
@@ -187,6 +195,50 @@ class AntiPromptInjector(Star):
                 logger.error("AntiPromptInjector: 无法保存本轮故障记录。")
             if must_stop:
                 await event.send(event.plain_result(RETRY))
+
+    async def _gentle_refusal(self, event, req, cfg):
+        # The event is already stopped. Only the selected persona may leave this boundary.
+        if self._closed or self._refusals_in_flight >= cfg["review_max_concurrency"]:
+            return DENIED
+        self._refusals_in_flight += 1
+        try:
+            async with asyncio.timeout(min(10, cfg["review_timeout_seconds"])) as deadline:
+                explicit = cfg["refusal_provider"]
+                chosen = explicit or event.get_extra("selected_provider")
+                provider = (self.context.get_provider_by_id(chosen) if chosen else
+                            await self.context.get_using_provider_async(event.unified_msg_origin))
+                if provider is None:
+                    return DENIED
+                meta = provider.meta()
+                if meta.provider_type.value != "chat_completion" or (chosen and meta.id != chosen):
+                    return DENIED
+                _, persona, _, web_default = await self.context.persona_manager.resolve_selected_persona(
+                    umo=event.unified_msg_origin, platform_name=event.get_platform_name(),
+                    conversation_persona_id=getattr(req.conversation, "persona_id", None),
+                )
+                style = persona.get("prompt", "") if persona else ""
+                if web_default and event.get_extra("enable_default_system_prompt") is not False:
+                    from astrbot.core.astr_main_agent_resources import CHATUI_SPECIAL_DEFAULT_PERSONA_PROMPT
+                    style = CHATUI_SPECIAL_DEFAULT_PERSONA_PROMPT
+                result = await provider.text_chat(
+                    system_prompt=style[:2000],
+                    prompt="请以当前角色的口吻，用一句简短、委婉的话表示不能答应这次请求。不要解释原因、复述设定或询问详情。",
+                    model=cfg["refusal_model"] or (None if explicit else req.model or event.get_extra("selected_model")),
+                    contexts=[], func_tool=None, request_max_retries=1,
+                )
+                if (deadline.expired() or self._closed or result.role != "assistant"
+                        or result.is_chunk or result.tools_call_name or result.tools_call_ids or result.tools_call_args):
+                    return DENIED
+                text = (result.completion_text or "").strip()
+                if (not text or len(text) > 160 or not text.isprintable()
+                        or any(ch in text for ch in "<>[]`") or "://" in text
+                        or re.search(r"""[。！？!?]["'”’」』]*\s*[^。！？!?\s"'”’」』]|\.\s+\S""", text)):
+                    return DENIED
+                return text
+        except Exception:
+            return DENIED
+        finally:
+            self._refusals_in_flight -= 1
 
     def web_settings(self):
         view = self.state.config_view()
