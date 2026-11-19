@@ -150,6 +150,125 @@ def runtime(runtime_modules, monkeypatch):
 pytestmark = pytest.mark.asyncio
 
 
+def onebot_turn(runtime, text=MARKER, mid="1234", **kw):
+    event, req = runtime.turn(text, **kw)
+    event.platform_meta.name = "aiocqhttp"
+    msg = event.message_obj
+    msg.self_id, msg.sender.user_id, msg.group_id, msg.message_id = "111", "222", "333", mid
+    msg.raw_message = dict(post_type="message", message_type="group", self_id=111,
+                           group_id=333, user_id=222, message_id=int(mid))
+    return event, req
+
+
+@pytest.mark.parametrize("case", ["rule", "mixed", "confirmed", "observe", "sample", "blacklist",
+                                  "failed", "incomplete", "off", "absent", "error", "cancel", "scope", "mismatch"])
+async def test_fact_reports_only_applied_protection(runtime, case):
+    runtime.settings(report_protection_to_bond=case != "off", defense_mode="intercept",
+                     llm_analysis_mode="active" if case in ("confirmed", "failed") else "disabled",
+                     gentle_refusal=True)
+    facts = []
+    async def receive(ticket):
+        fact = runtime.instance.take_protection_fact_v1(ticket)
+        assert runtime.instance.take_protection_fact_v1(ticket) is None
+        facts.append(fact)
+        if case == "error":
+            raise OSError()
+        if case == "cancel":
+            raise asyncio.CancelledError()
+    star = SimpleNamespace(activated=True, star_cls=SimpleNamespace(api=SimpleNamespace(
+        receive_protection_fact_v1=receive)))
+    runtime.context.get_registered_star = Mock(return_value=None if case == "absent" else star)
+    event, req = onebot_turn(runtime, "x" * 8300 if case == "incomplete" else MARKER,
+                             extra=EXTRA_MARKER if case == "mixed" else None)
+    if case == "scope":
+        event.plugins_name = []
+    if case == "mismatch":
+        event.message_obj.raw_message["user_id"] = 777
+    if case == "blacklist":
+        runtime.instance.state.put_entry("blacklist", runtime.identity(event))
+    if case == "observe":
+        runtime.instance.web_set_observation(1)
+    if case == "sample":
+        await runtime.instance.web_preview(MARKER)
+    else:
+        runtime.provider.text_chat.return_value = runtime.verdict(True) if case == "confirmed" else None
+        await runtime.hook(event, req)
+        assert event.is_stopped() == (case != "observe")
+    assert not runtime.instance._pending_facts
+    if case in ("rule", "mixed", "confirmed", "error", "cancel"):
+        assert len(facts) == 1
+        fact = facts[0]
+        assert set(fact) == {"platform", "event_id", "instance_id", "bot_id", "group_id",
+                             "user_id", "evidence", "source", "action", "attributable"}
+        assert fact["evidence"] == ("confirmed" if case == "confirmed" else "rule")
+        assert fact["attributable"] == (case != "mixed")
+        assert fact["action"] == "block" and MARKER not in repr(fact)
+    else:
+        assert not facts
+
+
+async def test_optional_bond_chain_and_external_candidate(runtime, tmp_path, monkeypatch):
+    path = os.getenv("ANTIPROMPTINJECTOR_BOND_SOURCE")
+    if not path:
+        pytest.skip("Set ANTIPROMPTINJECTOR_BOND_SOURCE to a compatible Bond checkout")
+    monkeypatch.syspath_prepend(str(Path(path).resolve(strict=True).parent))
+    from astrbot_plugin_bond.api.facade import BondFacade
+    from astrbot_plugin_bond.core.levels import LevelTable
+    from astrbot_plugin_bond.core.taskregistry import TaskRegistry
+    from astrbot_plugin_bond.services.assessment_service import AssessmentCapacity, AssessmentConfig, AssessmentService
+    from astrbot_plugin_bond.services.favor_service import FavorService
+    from astrbot_plugin_bond.services.runtime_service import RuntimeService
+    from astrbot_plugin_bond.storage.router import BotScopeStorageRouter
+    from astrbot.core.message.components import At
+    from astrbot.core.star import context as host_context
+    from astrbot.core.star.star import StarMetadata
+
+    storage = BotScopeStorageRouter(tmp_path)
+    model = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(completion_text=json.dumps(
+        dict(event_type="thanks", evidence="谢谢", confidence=0.95)), usage=None)))
+    def factory(store, mode):
+        favor = FavorService(store, LevelTable.from_config({}), scope_mode=mode)
+        assess = AssessmentService(store, favor, SimpleNamespace(get_provider_by_id=lambda _: model),
+                                  AssessmentConfig(enabled=True, small_provider_id="offline"),
+                                  AssessmentCapacity(), AsyncMock(return_value=[store]))
+        return SimpleNamespace(favor=favor, inject_enabled=False, assessment=assess, bot_id="111",
+                               registry=TaskRegistry())
+    router = RuntimeService(storage, dict(antipromptinjector_trust_enabled=True,
+                            external_assessment_enabled=True, assessment={"enabled": True}), factory)
+    api = BondFacade(router, runtime.context)
+    monkeypatch.setattr(host_context, "star_registry", [
+        StarMetadata(name="antipromptinjector", star_cls=runtime.instance),
+        StarMetadata(name="astrbot_plugin_bond", star_cls=SimpleNamespace(api=api)),
+    ])
+    runtime.context.get_registered_star = host_context.Context.get_registered_star.__get__(runtime.context)
+    runtime.settings(report_protection_to_bond=True, defense_mode="aegis", llm_analysis_mode="active")
+    runtime.provider.text_chat.return_value = runtime.verdict(True)
+    try:
+        for _ in range(2):
+            event, req = onebot_turn(runtime)
+            await runtime.hook(event, req)
+            assert not event.is_stopped() and runtime.main.NOTICE in req.system_prompt
+        favor = (await router.select("111")).favor
+        rec = await favor.get_relation("333", "222")
+        assert (rec.familiarity, rec.affinity, rec.trust) == (0, 0, -1)
+        assert await api.receive_protection_fact_v1({"evidence": "confirmed"}) == "invalid"
+        assert await api.receive_protection_fact_v1(object()) == "invalid"
+        event, req = onebot_turn(runtime, "谢谢你的帮助", mid="1235")
+        assert await api.submit_assessment_event_v1(event) == "filtered"
+        event.message_obj.message.insert(0, At(qq="111"))
+        event.plugins_name = []
+        assert await api.submit_assessment_event_v1(event) == "disabled"
+        event.plugins_name = None
+        event.message_obj.raw_message["message_id"] = 1000
+        assert await api.submit_assessment_event_v1(event) == "invalid"
+        event.message_obj.raw_message["message_id"] = 1235
+        assert await api.submit_assessment_event_v1(event) == "accepted"
+        assert await api.submit_assessment_event_v1(event) == "duplicate_or_cooldown"
+        assert model.text_chat.await_count == 1
+    finally:
+        await storage.close()
+
+
 @pytest.mark.parametrize("explicit", [True, False])
 async def test_gentle_refusal_follows_persona_not_original_request(runtime, explicit):
     runtime.settings(defense_mode="intercept", llm_analysis_mode="disabled", gentle_refusal=True,

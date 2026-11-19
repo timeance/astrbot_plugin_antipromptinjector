@@ -6,6 +6,7 @@
         "hint": "sentry：加固后继续；aegis：复核后决定是否加固；scorch：替换风险请求，无法隔离则阻断；intercept：停止本轮。"
     },
     "protect_group_chat": {"description": "检测群聊", "type": "bool", "default": true},
+    "report_protection_to_bond": {"description": "向 Bond 报告群聊防护结果", "type": "bool", "default": false, "hint": "仅限 OneBot 群聊，不发送消息原文。信任度由 Bond 管理。"},
     "protect_private_chat": {"description": "检测私聊", "type": "bool", "default": true},
     "scan_extra_text": {"description": "检测本轮额外文本", "type": "bool", "default": true},
     "detect_encoded": {"description": "检查编码文本", "type": "bool", "default": true},

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import re
 import time
 import uuid
@@ -35,7 +37,7 @@ def _review_data(result):
     }
 
 
-@register("antipromptinjector", "LumineStory", "提示词防护与可选模型复核", "4.1.0")
+@register("antipromptinjector", "LumineStory", "提示词防护与可选模型复核", "4.2.0")
 class AntiPromptInjector(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -43,6 +45,7 @@ class AntiPromptInjector(Star):
         self.detector = PromptThreatDetector()
         self.reviewer = ReviewService(context)
         self._refusals_in_flight = 0
+        self._pending_facts = {}
         self._closed = False
         self._routes = []
         register_web_api(self)
@@ -51,6 +54,7 @@ class AntiPromptInjector(Star):
 
     async def terminate(self):
         self._closed = True
+        self._pending_facts.clear()
         routes = self.context.registered_web_apis
         routes[:] = [route for route in routes if not any(route is old for old in self._routes)]
 
@@ -166,6 +170,12 @@ class AntiPromptInjector(Star):
                                   confidence=review.confidence if review else None)
             except Exception:
                 logger.error("AntiPromptInjector: 无法保存本轮诊断记录。")
+            if (cfg["report_protection_to_bond"] and decision["complete"] and not decision["observing"]
+                    and action in ("block", "replace", "harden") and decision["reason"] in
+                    ("rule_evidence", "review_confirmed", "replacement_unavailable")):
+                origins = {blocks[k].source for signal in analysis["signals"] for k in signal["sources"]}
+                await self._report_to_bond(event, decision, source if len(origins) <= 1 else "mixed",
+                                           attributable)
             if action == "block":
                 reply = DENIED
                 if decision["reason"] in ("inspection_incomplete", "review_failure"):
@@ -195,6 +205,55 @@ class AntiPromptInjector(Star):
                 logger.error("AntiPromptInjector: 无法保存本轮故障记录。")
             if must_stop:
                 await event.send(event.plain_result(RETRY))
+
+    def take_protection_fact_v1(self, ticket):
+        return self._pending_facts.pop(ticket, None)
+
+    async def _report_to_bond(self, event, decision, source, attributable):
+        ticket = object()
+        try:
+            if self._closed or len(self._pending_facts) >= 32:
+                return
+            name = "astrbot_plugin_bond"
+            if event.plugins_name is not None and name not in event.plugins_name:
+                return
+            platform = event.get_platform_name()
+            bot, group, user = event.get_self_id(), event.get_group_id(), event.get_sender_id()
+            instance = event.get_platform_id()
+            mid = str(getattr(event.message_obj, "message_id", ""))
+            if (platform != "aiocqhttp" or not instance
+                    or not all(isinstance(i, str) and re.fullmatch(r"[1-9][0-9]{0,31}", i)
+                               for i in (bot, group, user))
+                    or not re.fullmatch(r"-?[1-9][0-9]{0,19}", mid)):
+                return
+            read = getattr(getattr(event.message_obj, "raw_message", None), "get", None)
+            if (not callable(read) or read("post_type") != "message" or read("message_type") != "group"
+                    or any(str(read(k)) != v for k, v in (("self_id", bot), ("group_id", group),
+                                                           ("user_id", user), ("message_id", mid)))):
+                return
+            star = self.context.get_registered_star(name)
+            if not star or not star.activated:
+                return
+            receive = getattr(getattr(star.star_cls, "api", None), "receive_protection_fact_v1", None)
+            if not callable(receive):
+                return
+            # The same OneBot message can arrive on two adapter connections.
+            key = json.dumps([platform, bot, group, user, mid], separators=(",", ":")).encode()
+            self._pending_facts[ticket] = {
+                "event_id": "api:v1:" + hashlib.sha256(key).hexdigest(),
+                "platform": platform, "instance_id": instance, "bot_id": bot,
+                "group_id": group, "user_id": user, "source": source,
+                "attributable": attributable, "action": decision["action"],
+                "evidence": "confirmed" if decision["review_status"] == "confirmed" else "rule",
+            }
+            await asyncio.wait_for(asyncio.create_task(receive(ticket)), timeout=1)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+        except Exception:
+            logger.warning("AntiPromptInjector: Bond 未接收防护结果。")
+        finally:
+            self._pending_facts.pop(ticket, None)
 
     async def _gentle_refusal(self, event, req, cfg):
         # The event is already stopped. Only the selected persona may leave this boundary.
