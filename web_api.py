@@ -1,5 +1,6 @@
 """Dashboard transport. The plugin owns persistence and runtime decisions."""
 
+import asyncio
 import inspect
 import json
 import re
@@ -148,6 +149,28 @@ def register_web_api(plugin):
     async def settings():
         return _snapshot(await call("web_settings"))
 
+    async def providers():
+        choices = []
+        for provider in plugin.context.get_all_providers():
+            meta = provider.meta()
+            if meta.provider_type.value == "chat_completion":
+                choices.append({"id": _string(meta.id, 256, required=True),
+                                "model": _string(provider.get_model() or "", 256)})
+        return choices
+
+    async def models(body):
+        _object(body, ("provider",))
+        selected = _string(body["provider"], 256, required=True)
+        provider = plugin.context.get_provider_by_id(selected)
+        if provider is None or provider.meta().id != selected or provider.meta().provider_type.value != "chat_completion":
+            raise InvalidRequest("该对话提供商已不可用。")
+        async with asyncio.timeout(6):
+            names = await provider.get_models()
+        if not isinstance(names, (list, tuple)):
+            raise TypeError("Invalid model list")
+        return sorted({s for s in names if isinstance(s, str) and s.strip() == s
+                       and 0 < len(s) <= 256 and s.isprintable()})[:2000]
+
     async def save(body):
         _object(body, ("revision", "patch"))
         revision = _string(body["revision"], 128, required=True)
@@ -280,6 +303,8 @@ def register_web_api(plugin):
     for path, verb, handler in (
         ("overview", "GET", overview),
         ("settings", "GET", settings),
+        ("providers", "GET", providers),
+        ("models", "POST", models),
         ("settings/save", "POST", save),
         ("observation", "POST", observe),
         ("entries", "GET", entries),

@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,6 +143,21 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
                     self.request.username = name
                     self.assertEqual((await self.call(path, {}, verb=verb))[0], code)
         self.assertEqual(self.plugin.calls, [])
+
+    async def test_picker_discloses_only_chat_ids_and_models(self):
+        def provider(id_, kind):
+            return types.SimpleNamespace(
+                meta=lambda: types.SimpleNamespace(id=id_, provider_type=types.SimpleNamespace(value=kind)),
+                get_model=lambda: "default", get_models=AsyncMock(return_value=["m2", "m1", "m1"]),
+                provider_config={"key": "never-send"})
+        chat, speech = provider("chat", "chat_completion"), provider("tts", "tts")
+        self.plugin.context.get_all_providers = lambda: [chat, speech]
+        self.plugin.context.get_provider_by_id = Mock(side_effect={"chat": chat, "tts": speech}.get)
+        self.assertEqual(await self.call("providers"), (200, [{"id": "chat", "model": "default"}]))
+        self.assertEqual(await self.call("models", {"provider": "chat"}), (200, ["m1", "m2"]))
+        for id_ in ("missing", "tts"):
+            self.assertEqual((await self.call("models", {"provider": id_}))[0], 400)
+        speech.get_models.assert_not_awaited()
 
     async def test_missing_context_wrong_plugin_and_demo(self):
         self.web.request = property(lambda: None)

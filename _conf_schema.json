@@ -29,7 +29,7 @@
         "hint": "active：主动复核；standby：按风险触发；disabled：关闭。sentry 不发起复核。"
     },
     "review_provider": {
-        "description": "复核 Provider ID", "type": "string", "default": "",
+        "description": "复核提供商", "type": "string", "default": "", "_special": "select_provider",
         "hint": "留空时按真实会话来源选择。"
     },
     "review_model": {"description": "复核模型", "type": "string", "default": "", "hint": "留空使用所选 Provider 的模型。"},
@@ -42,5 +42,8 @@
     "review_timeout_seconds": {"description": "复核超时（秒，1–60）", "type": "int", "default": 10},
     "review_max_concurrency": {"description": "复核并发上限（1–16）", "type": "int", "default": 2},
     "review_max_chars": {"description": "复核输入上限（字符，256–8192）", "type": "int", "default": 4096},
+    "gentle_refusal": {"description": "委婉拒绝", "type": "bool", "default": false, "hint": "因注入风险实际阻断时，用当前人格生成一句拒绝；可能产生模型费用。"},
+    "refusal_provider": {"description": "拒绝回复提供商", "type": "string", "default": "", "_special": "select_provider", "hint": "留空跟随当前会话。"},
+    "refusal_model": {"description": "拒绝回复模型", "type": "string", "default": "", "hint": "默认跟随会话模型；另选提供商后使用该提供商的默认模型。"},
     "incident_history_size": {"description": "诊断记录保留条数（1–5000）", "type": "int", "default": 100}
 }
